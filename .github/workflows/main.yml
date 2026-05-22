@@ -1,205 +1,86 @@
-name: دانلودر پورن هاب
+- name: Download video (retry up to 5 times)
+  id: download
+  run: |
+    FOLDER="${{ github.event.inputs.output_folder }}"
+    mkdir -p "$FOLDER"
+    touch marker
 
-on:
-  workflow_dispatch:
-    inputs:
-      url:
-        description: 'URL of the video'
-        required: true
-        type: string
-      output_folder:
-        description: 'Folder where the video will be saved'
-        required: false
-        type: string
-        default: 'downloads'
-      quality:
-        description: 'Video quality (yt-dlp format selector)'
-        required: true
-        type: string
-        default: 'bestvideo[height<=720]+bestaudio/best[ext=mp4]/best'
-      archive_name:
-        description: 'Base name for the RAR archive (if file is split)'
-        required: false
-        type: string
-        default: 'video'
+    MAX_RETRIES=5
+    RETRY_COUNT=0
+    SUCCESS=false
+    LAST_ERROR=""
 
-permissions:
-  contents: write
-
-jobs:
-  download-and-maybe-split:
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10'
-
-      - name: Install dependencies
-        run: |
-          pip install --upgrade yt-dlp
-          sudo apt-get update && sudo apt-get install -y bc curl wget
-
-      - name: Validate URL
-        run: |
-          URL="${{ github.event.inputs.url }}"
-          echo "Testing URL: $URL"
-          curl -I -L --max-time 10 "$URL" || echo "Warning: URL validation failed, but continuing..."
-
-      - name: Download video (retry up to 5 times)
-        id: download
-        run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
-          mkdir -p "$FOLDER"
-          touch marker
-
-          MAX_RETRIES=5
-          RETRY_COUNT=0
-          SUCCESS=false
-          LAST_ERROR=""
-
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            echo "=== Download attempt $((RETRY_COUNT+1))/$MAX_RETRIES ==="
-            
-            yt-dlp \
-              --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
-              --format "${{ github.event.inputs.quality }}" \
-              --merge-output-format mp4 \
-              --retries 3 \
-              --fragment-retries 10 \
-              --no-check-certificate \
-              --geo-bypass \
-              --geo-bypass-country US \
-              --socket-timeout 30 \
-              --no-color \
-              --ignore-errors \
-              --newline \
-              -v \
-              "${{ github.event.inputs.url }}" 2>&1 | tee download_log.txt && {
-                NEW_FILE=$(find "$FOLDER" -type f -newer marker -print -quit)
-                if [ -n "$NEW_FILE" ]; then
-                  echo "✓ Download succeeded: $NEW_FILE"
-                  SUCCESS=true
-                  break
-                else
-                  echo "⚠ Command exited with code 0, but no new file was found. Retrying..."
-                  LAST_ERROR="No file created despite success code"
-                fi
-              } || {
-                EXIT_CODE=$?
-                echo "✗ Download attempt failed with exit code $EXIT_CODE"
-                
-                if grep -q "HTTP Error 410" download_log.txt; then
-                  echo "ERROR: Video not found (HTTP 410). Video deleted or unavailable."
-                  LAST_ERROR="HTTP 410: Gone"
-                  break
-                elif grep -q "HTTP Error 404" download_log.txt; then
-                  echo "ERROR: URL not found (HTTP 404)."
-                  LAST_ERROR="HTTP 404: Not Found"
-                  break
-                elif grep -q "HTTP Error 403" download_log.txt; then
-                  echo "WARNING: Access Forbidden (HTTP 403). Region-blocked or account-restricted."
-                  LAST_ERROR="HTTP 403: Forbidden"
-                else
-                  LAST_ERROR="Connection/Unknown error"
-                fi
-              }
-            
-            RETRY_COUNT=$((RETRY_COUNT+1))
-            
-            if [ "$SUCCESS" != true ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-              WAIT_TIME=$((5 * RETRY_COUNT))
-              echo "Waiting ${WAIT_TIME} seconds before next attempt..."
-              sleep $WAIT_TIME
-            fi
-          done
-
-          if [ "$SUCCESS" = false ]; then
-            echo "❌ All $MAX_RETRIES download attempts failed."
-            echo "Last error: $LAST_ERROR"
-            exit 1
-          fi
-
-          FILENAME=$(basename "$NEW_FILE")
-          SIZE_BYTES=$(stat -c %s "$NEW_FILE")
-          echo "filename=$FILENAME" >> $GITHUB_OUTPUT
-          echo "size_bytes=$SIZE_BYTES" >> $GITHUB_OUTPUT
-          echo "✓ Downloaded: $NEW_FILE (${SIZE_BYTES} bytes)"
-        shell: bash
-
-      - name: Install RAR
-        run: sudo apt-get install -y rar
-
-      - name: Conditional split (if file > 99 MB)
-        id: split
-        run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
-          FILENAME="${{ steps.download.outputs.filename }}"
-          SIZE_BYTES="${{ steps.download.outputs.size_bytes }}"
-          
-          if [ -z "$SIZE_BYTES" ]; then
-            echo "❌ Error: size_bytes not set"
-            exit 1
-          fi
-          
-          SIZE_MB=$(echo "scale=2; $SIZE_BYTES / 1048576" | bc)
-          THRESHOLD_MB=99
-
-          cd "$FOLDER"
-
-          if (( $(echo "$SIZE_MB > $THRESHOLD_MB" | bc -l) )); then
-            echo "📦 File size ${SIZE_MB} MB exceeds ${THRESHOLD_MB} MB – splitting into 95 MB RAR parts."
-            RANDOM_HEX=$(openssl rand -hex 3)
-            ARCHIVE_NAME="${{ github.event.inputs.archive_name }}_${RANDOM_HEX}"
-            echo "Archive base name: ${ARCHIVE_NAME}"
-            
-            if rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"; then
-              rm "$FILENAME"
-              echo "split_done=true" >> $GITHUB_OUTPUT
-              echo "✓ Split completed. Parts created:"
-              ls -lh "${ARCHIVE_NAME}.part"*.rar
-            else
-              echo "❌ RAR split failed"
-              exit 1
-            fi
+    while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+      echo "=== Download attempt $((RETRY_COUNT+1))/$MAX_RETRIES ==="
+      
+      yt-dlp \
+        --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
+        --format "${{ github.event.inputs.quality }}" \
+        --merge-output-format mp4 \
+        --retries 3 \
+        --fragment-retries 10 \
+        --no-check-certificate \
+        --geo-bypass \
+        --geo-bypass-country US \
+        --socket-timeout 30 \
+        --no-color \
+        --newline \
+        -v \
+        --user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" \
+        --add-header "Accept-Language:en-US,en;q=0.9" \
+        --add-header "Cookie:age_gate_passed=1" \
+        --add-header "X-Forwarded-For:1.1.1.1" \
+        "${{ github.event.inputs.url }}" 2>&1 | tee download_log.txt && {
+          NEW_FILE=$(find "$FOLDER" -type f -newer marker -print -quit)
+          if [ -n "$NEW_FILE" ]; then
+            echo "✓ Download succeeded: $NEW_FILE"
+            SUCCESS=true
+            break
           else
-            echo "✓ File size ${SIZE_MB} MB is ≤${THRESHOLD_MB} MB – keeping original."
-            echo "split_done=false" >> $GITHUB_OUTPUT
+            echo "⚠ Command exited with code 0, but no new file was found. Retrying..."
+            LAST_ERROR="No file created despite success code"
           fi
-
-      - name: Generate summary
-        if: success()
-        run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
-          echo "📊 Download Summary:"
-          du -sh "$FOLDER"
-          ls -lh "$FOLDER/"
-
-      - name: Commit and push to repository
-        if: success()
-        run: |
-          FOLDER="${{ github.event.inputs.output_folder }}"
+        } || {
+          EXIT_CODE=$?
+          echo "✗ Download attempt failed with exit code $EXIT_CODE"
           
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          
-          if ! git diff --quiet "$FOLDER/"; then
-            git add "$FOLDER/"
-            git commit -m "✓ Add downloaded video(s) - $(date +'%Y-%m-%d %H:%M:%S')"
-            git push
-            echo "✓ Changes pushed"
+          if grep -q "HTTP Error 410" download_log.txt; then
+            echo "ERROR: Video not found (HTTP 410). Video deleted or unavailable."
+            LAST_ERROR="HTTP 410: Gone"
+            break
+          elif grep -q "HTTP Error 404" download_log.txt; then
+            echo "ERROR: URL not found (HTTP 404)."
+            LAST_ERROR="HTTP 404: Not Found"
+            break
+          elif grep -q "HTTP Error 403" download_log.txt; then
+            echo "WARNING: Access Forbidden (HTTP 403). Region-blocked or account-restricted."
+            LAST_ERROR="HTTP 403: Forbidden"
+          elif grep -q "ERROR.*unavailable" download_log.txt; then
+            echo "ERROR: Video unavailable - age verification required"
+            LAST_ERROR="Age verification required"
+            break
           else
-            echo "ℹ No changes to commit"
+            LAST_ERROR="Connection/Unknown error"
           fi
+        }
+      
+      RETRY_COUNT=$((RETRY_COUNT+1))
+      
+      if [ "$SUCCESS" != true ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+        WAIT_TIME=$((5 * RETRY_COUNT))
+        echo "Waiting ${WAIT_TIME} seconds before next attempt..."
+        sleep $WAIT_TIME
+      fi
+    done
 
-      - name: Upload logs on failure
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: download-logs
-          path: download_log.txt
-          retention-days: 7
+    if [ "$SUCCESS" = false ]; then
+      echo "❌ All $MAX_RETRIES download attempts failed."
+      echo "Last error: $LAST_ERROR"
+      exit 1
+    fi
+
+    FILENAME=$(basename "$NEW_FILE")
+    SIZE_BYTES=$(stat -c %s "$NEW_FILE")
+    echo "filename=$FILENAME" >> $GITHUB_OUTPUT
+    echo "size_bytes=$SIZE_BYTES" >> $GITHUB_OUTPUT
+    echo "✓ Downloaded: $NEW_FILE (${SIZE_BYTES} bytes)"
