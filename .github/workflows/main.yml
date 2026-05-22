@@ -44,11 +44,39 @@ jobs:
           pip install --upgrade yt-dlp
           sudo apt-get update && sudo apt-get install -y bc curl wget
 
+      - name: Fetch free proxy
+        id: proxy
+        run: |
+          echo "🌐 Fetching free proxy list..."
+          
+          # Try multiple proxy sources
+          PROXY_URL=$(curl -s "https://www.proxy-list.download/api/v1/get?type=http" 2>/dev/null | grep -o '"ip":"[^"]*","port":"[^"]*' | head -1 | sed 's/"ip":"\([^"]*\)".*"port":"\([^"]*\)"/\1:\2/' || echo "")
+          
+          if [ -z "$PROXY_URL" ]; then
+            echo "First source failed, trying alternative..."
+            PROXY_URL=$(curl -s "https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt" 2>/dev/null | head -1 || echo "")
+          fi
+          
+          if [ -z "$PROXY_URL" ]; then
+            echo "⚠️  Could not fetch proxy, will proceed without proxy"
+            echo "proxy_url=" >> $GITHUB_OUTPUT
+          else
+            echo "✓ Proxy fetched successfully: $PROXY_URL"
+            echo "proxy_url=$PROXY_URL" >> $GITHUB_OUTPUT
+          fi
+
       - name: Validate URL
         run: |
           URL="${{ github.event.inputs.url }}"
-          echo "Testing URL: $URL"
-          curl -I -L --max-time 10 "$URL" || echo "Warning: URL validation failed, but continuing..."
+          PROXY="${{ steps.proxy.outputs.proxy_url }}"
+          
+          echo "🔗 Testing URL: $URL"
+          if [ -n "$PROXY" ]; then
+            echo "Using proxy: $PROXY"
+            curl -I -L --max-time 10 --proxy "$PROXY" "$URL" 2>&1 | head -5 || echo "⚠️  URL validation with proxy failed, will retry during download..."
+          else
+            curl -I -L --max-time 10 "$URL" 2>&1 | head -5 || echo "⚠️  URL validation failed, but continuing..."
+          fi
 
       - name: Download video (retry up to 5 times)
         id: download
@@ -61,63 +89,102 @@ jobs:
           RETRY_COUNT=0
           SUCCESS=false
           LAST_ERROR=""
+          PROXY="${{ steps.proxy.outputs.proxy_url }}"
 
           while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            echo "=== Download attempt $((RETRY_COUNT+1))/$MAX_RETRIES ==="
+            echo ""
+            echo "=========================================="
+            echo "📥 Download attempt $((RETRY_COUNT+1))/$MAX_RETRIES"
+            echo "=========================================="
             
-            yt-dlp \
-              --output "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s" \
-              --format "${{ github.event.inputs.quality }}" \
-              --merge-output-format mp4 \
-              --retries 3 \
-              --fragment-retries 10 \
-              --no-check-certificate \
-              --geo-bypass \
-              --geo-bypass-country US \
-              --socket-timeout 30 \
-              --no-color \
-              --ignore-errors \
-              --newline \
-              -v \
-              "${{ github.event.inputs.url }}" 2>&1 | tee download_log.txt && {
-                NEW_FILE=$(find "$FOLDER" -type f -newer marker -print -quit)
-                if [ -n "$NEW_FILE" ]; then
-                  echo "✓ Download succeeded: $NEW_FILE"
-                  SUCCESS=true
-                  break
-                else
-                  echo "⚠ Command exited with code 0, but no new file was found. Retrying..."
-                  LAST_ERROR="No file created despite success code"
-                fi
-              } || {
-                EXIT_CODE=$?
-                echo "✗ Download attempt failed with exit code $EXIT_CODE"
-                
-                if grep -q "HTTP Error 410" download_log.txt; then
-                  echo "ERROR: Video not found (HTTP 410). Video deleted or unavailable."
-                  LAST_ERROR="HTTP 410: Gone"
-                  break
-                elif grep -q "HTTP Error 404" download_log.txt; then
-                  echo "ERROR: URL not found (HTTP 404)."
-                  LAST_ERROR="HTTP 404: Not Found"
-                  break
-                elif grep -q "HTTP Error 403" download_log.txt; then
-                  echo "WARNING: Access Forbidden (HTTP 403). Region-blocked or account-restricted."
-                  LAST_ERROR="HTTP 403: Forbidden"
-                else
-                  LAST_ERROR="Connection/Unknown error"
-                fi
-              }
+            if [ -n "$PROXY" ]; then
+              echo "🔄 Using proxy: $PROXY"
+            else
+              echo "⚠️  No proxy available, downloading directly"
+            fi
+            
+            # Build yt-dlp command with array
+            YT_DLP_CMD=(
+              "yt-dlp"
+              "--output" "./$FOLDER/%(uploader)s - %(title)s - %(id)s.%(ext)s"
+              "--format" "${{ github.event.inputs.quality }}"
+              "--merge-output-format" "mp4"
+              "--retries" "3"
+              "--fragment-retries" "10"
+              "--no-check-certificate"
+              "--geo-bypass"
+              "--geo-bypass-country" "US"
+              "--socket-timeout" "30"
+              "--no-color"
+              "--ignore-errors"
+              "--newline"
+              "-v"
+            )
+            
+            # Add proxy if available
+            if [ -n "$PROXY" ]; then
+              YT_DLP_CMD+=("--proxy" "$PROXY")
+            fi
+            
+            # Add URL
+            YT_DLP_CMD+=("${{ github.event.inputs.url }}")
+            
+            # Execute download
+            "${YT_DLP_CMD[@]}" 2>&1 | tee download_log.txt && {
+              NEW_FILE=$(find "$FOLDER" -type f -newer marker -print -quit)
+              if [ -n "$NEW_FILE" ]; then
+                echo "✅ Download succeeded: $NEW_FILE"
+                SUCCESS=true
+                break
+              else
+                echo "⚠️  Command succeeded but no new file was found. Retrying..."
+                LAST_ERROR="No file created despite success code"
+              fi
+            } || {
+              EXIT_CODE=$?
+              echo "❌ Download attempt failed with exit code $EXIT_CODE"
+              
+              if grep -q "HTTP Error 410" download_log.txt 2>/dev/null; then
+                echo "🚫 ERROR: Video not found (HTTP 410). Video deleted or unavailable."
+                LAST_ERROR="HTTP 410: Gone"
+                break
+              elif grep -q "HTTP Error 404" download_log.txt 2>/dev/null; then
+                echo "🚫 ERROR: URL not found (HTTP 404)."
+                LAST_ERROR="HTTP 404: Not Found"
+                break
+              elif grep -q "HTTP Error 403" download_log.txt 2>/dev/null; then
+                echo "⛔ WARNING: Access Forbidden (HTTP 403). Will try with different proxy..."
+                LAST_ERROR="HTTP 403: Forbidden"
+              else
+                LAST_ERROR="Connection/Unknown error"
+              fi
+            }
             
             RETRY_COUNT=$((RETRY_COUNT+1))
             
             if [ "$SUCCESS" != true ] && [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+              # Try to get new proxy on specific retry attempts
+              if grep -q "HTTP Error 403" download_log.txt 2>/dev/null || [ $RETRY_COUNT -eq 2 ] || [ $RETRY_COUNT -eq 4 ]; then
+                echo ""
+                echo "🔄 Fetching alternative proxy for next attempt..."
+                NEW_PROXY=$(curl -s "https://www.proxy-list.download/api/v1/get?type=http" 2>/dev/null | grep -o '"ip":"[^"]*","port":"[^"]*' | tail -n +2 | head -1 | sed 's/"ip":"\([^"]*\)".*"port":"\([^"]*\)"/\1:\2/' || echo "")
+                if [ -n "$NEW_PROXY" ]; then
+                  PROXY="$NEW_PROXY"
+                  echo "✓ New proxy obtained: $PROXY"
+                else
+                  echo "⚠️  Could not fetch new proxy"
+                fi
+              fi
+              
               WAIT_TIME=$((5 * RETRY_COUNT))
-              echo "Waiting ${WAIT_TIME} seconds before next attempt..."
+              echo "⏳ Waiting ${WAIT_TIME} seconds before next attempt..."
               sleep $WAIT_TIME
             fi
           done
 
+          echo ""
+          echo "=========================================="
+          
           if [ "$SUCCESS" = false ]; then
             echo "❌ All $MAX_RETRIES download attempts failed."
             echo "Last error: $LAST_ERROR"
@@ -128,7 +195,7 @@ jobs:
           SIZE_BYTES=$(stat -c %s "$NEW_FILE")
           echo "filename=$FILENAME" >> $GITHUB_OUTPUT
           echo "size_bytes=$SIZE_BYTES" >> $GITHUB_OUTPUT
-          echo "✓ Downloaded: $NEW_FILE (${SIZE_BYTES} bytes)"
+          echo "✅ Downloaded: $NEW_FILE (${SIZE_BYTES} bytes)"
         shell: bash
 
       - name: Install RAR
@@ -160,14 +227,14 @@ jobs:
             if rar a -v95m -m5 -ep1 "${ARCHIVE_NAME}.rar" "$FILENAME"; then
               rm "$FILENAME"
               echo "split_done=true" >> $GITHUB_OUTPUT
-              echo "✓ Split completed. Parts created:"
+              echo "✅ Split completed. Parts created:"
               ls -lh "${ARCHIVE_NAME}.part"*.rar
             else
               echo "❌ RAR split failed"
               exit 1
             fi
           else
-            echo "✓ File size ${SIZE_MB} MB is ≤${THRESHOLD_MB} MB – keeping original."
+            echo "✅ File size ${SIZE_MB} MB is ≤${THRESHOLD_MB} MB – keeping original."
             echo "split_done=false" >> $GITHUB_OUTPUT
           fi
 
@@ -191,9 +258,9 @@ jobs:
             git add "$FOLDER/"
             git commit -m "✓ Add downloaded video(s) - $(date +'%Y-%m-%d %H:%M:%S')"
             git push
-            echo "✓ Changes pushed"
+            echo "✅ Changes pushed successfully"
           else
-            echo "ℹ No changes to commit"
+            echo "ℹ️  No changes to commit"
           fi
 
       - name: Upload logs on failure
